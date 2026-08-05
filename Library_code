@@ -1,0 +1,678 @@
+import os
+import re
+import io
+import base64
+import warnings
+from typing import Union, List, Dict, Optional, Any
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+warnings.filterwarnings('ignore')
+
+
+class DataAnalyzer:
+    """
+    Automated Exploratory Data Analysis (EDA) Pipeline.
+    Supports continuous, categorical, datetime, and text data standardizations,
+    statistical hypothesis testing, feature importance, multicollinearity detection,
+    intelligent plotting, and HTML/PDF report generation.
+    """
+
+    MAX_CAT_CARDINALITY = 10
+
+    def __init__(
+        self,
+        data: Any,
+        target_col: Optional[str] = None,
+        exclude_cols: Optional[List[str]] = None,
+        random_state: int = 42,
+        verbose: bool = True,
+        show_plots: bool = True,
+        save_dir: Optional[str] = None,
+        download: bool = False,
+        export_pdf: bool = False
+    ):
+        self.random_state = random_state
+        np.random.seed(self.random_state)
+        
+        self.verbose = verbose
+        self.download = download
+        self.show_plots = show_plots and not self.download
+        self.export_pdf = export_pdf
+        self.save_dir = save_dir or "eda_results"
+        
+        if self.download or self.save_dir:
+            os.makedirs(self.save_dir, exist_ok=True)
+
+        # Standardize input data to pandas DataFrame
+        self.df = self._standardize_data(data)
+        
+        # Exclude specified columns
+        if exclude_cols:
+            existing_excludes = [c for c in exclude_cols if c in self.df.columns]
+            self.df = self.df.drop(columns=existing_excludes)
+
+        # Target Column Setup
+        self.target_col = target_col
+        if self.target_col and self.target_col not in self.df.columns:
+            self._log(f"Warning: Target column '{self.target_col}' not found. Reverting to target-agnostic mode.")
+            self.target_col = None
+
+        # Detect Semantic Dtypes
+        self.semantic_types = self._detect_semantic_types()
+
+        # Attribute Storage for Programmatic Access
+        self.quality_report_: Dict[str, Any] = {}
+        self.outlier_report_: Optional[pd.DataFrame] = None
+        self.bivariate_stats_: Optional[pd.DataFrame] = None
+        self.feature_importance_: Optional[pd.DataFrame] = None
+        self.vif_report_: Optional[pd.DataFrame] = None
+        self.top_feature_pairs_: Optional[pd.DataFrame] = None
+        self.report_path_: Optional[str] = None
+        self._encoded_plots: List[Dict[str, str]] = []
+
+    # =========================================================================
+    # INTERNAL HELPERS & INGESTION
+    # =========================================================================
+
+    def _log(self, message: str) -> None:
+        """Helper to manage output logging based on verbose and download settings."""
+        if self.verbose and not self.download:
+            print(message)
+
+    def _sanitize_filename(self, name: str) -> str:
+        """Sanitizes strings for safe filename creation."""
+        return re.sub(r'[^\w\-]', '_', name).strip('_')
+
+    def _standardize_data(self, data: Any) -> pd.DataFrame:
+        """Converts DataFrames, Series, NumPy Arrays, Polars, Lists, or Dicts into Pandas DataFrame."""
+        if isinstance(data, pd.DataFrame):
+            return data.copy()
+        elif isinstance(data, pd.Series):
+            return data.to_frame()
+        elif isinstance(data, np.ndarray):
+            if data.ndim == 1:
+                return pd.DataFrame(data, columns=['feature_0'])
+            return pd.DataFrame(data, columns=[f'feature_{i}' for i in range(data.shape[1])])
+        elif isinstance(data, (dict, list)):
+            return pd.DataFrame(data)
+        else:
+            # Handle optional Polars integration gracefully
+            try:
+                import polars as pl
+                if isinstance(data, pl.DataFrame):
+                    return data.to_pandas()
+            except ImportError:
+                pass
+            raise TypeError(f"Unsupported data type: {type(data)}")
+
+    def _detect_semantic_types(self) -> Dict[str, List[str]]:
+        """Categorizes features into continuous, categorical, datetime, and text types."""
+        types = {'datetime': [], 'continuous': [], 'categorical': [], 'text': []}
+        
+        for col in self.df.columns:
+            s = self.df[col]
+            n_unique = s.nunique(dropna=True)
+            n_total = s.dropna().count()
+            unique_ratio = n_unique / n_total if n_total > 0 else 0
+
+            # 1. Datetime Detection
+            if pd.api.types.is_datetime64_any_dtype(s):
+                types['datetime'].append(col)
+                continue
+            elif s.dtype == 'object':
+                try:
+                    converted = pd.to_datetime(s.dropna().head(100), errors='raise')
+                    types['datetime'].append(col)
+                    self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
+                    continue
+                except Exception:
+                    pass
+
+            # 2. Continuous Detection
+            if pd.api.types.is_numeric_dtype(s):
+                if n_unique >= 15 and unique_ratio >= 0.05:
+                    types['continuous'].append(col)
+                else:
+                    types['categorical'].append(col)
+            # 3. Categorical / Text Detection
+            else:
+                if n_unique < 20 or unique_ratio < 0.5:
+                    types['categorical'].append(col)
+                else:
+                    types['text'].append(col)
+
+        return types
+
+    def _save_or_show_plot(self, fig: plt.Figure, title: str) -> None:
+        """Handles display, disk storage, and base64 encoding for report generation."""
+        sanitized_title = self._sanitize_filename(title)
+        
+        if self.save_dir:
+            file_path = os.path.join(self.save_dir, f"{sanitized_title}.png")
+            fig.savefig(file_path, bbox_inches='tight', dpi=150)
+
+        if self.download:
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+            buf.seek(0)
+            img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+            self._encoded_plots.append({'title': title, 'image': img_b64})
+            buf.close()
+
+        if self.show_plots:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    # =========================================================================
+    # CORE ANALYSIS METHODS
+    # =========================================================================
+
+    def summarize(self) -> 'DataAnalyzer':
+        """Outputs high-level dataset statistics."""
+        self._log("==================================================")
+        self._log("DATASET SUMMARY")
+        self._log("==================================================")
+        self._log(f"Rows: {self.df.shape[0]} | Columns: {self.df.shape[1]}")
+        self._log(f"Target Variable: {self.target_col if self.target_col else 'None'}")
+        
+        total_cells = self.df.shape[0] * self.df.shape[1]
+        missing_cells = self.df.isnull().sum().sum()
+        self._log(f"Global Missingness: {missing_cells} / {total_cells} ({missing_cells / total_cells:.1%})")
+        self._log(f"Detected Types: { {k: len(v) for k, v in self.semantic_types.items()} }\n")
+        return self
+
+    def data_quality_report(self) -> 'DataAnalyzer':
+        """Evaluates duplicate rows, constant columns, missingness, cardinality, and skewness."""
+        self._log("==================================================")
+        self._log("1. DATA QUALITY REPORT")
+        self._log("==================================================")
+        
+        duplicates = int(self.df.duplicated().sum())
+        constants = [c for c in self.df.columns if self.df[c].nunique(dropna=False) <= 1]
+        
+        missing_pct = (self.df.isnull().mean() * 100).round(1)
+        high_missing = missing_pct[missing_pct > 50].to_dict()
+
+        high_cardinality = [
+            c for c in self.semantic_types['categorical']
+            if self.df[c].nunique() > self.MAX_CAT_CARDINALITY
+        ]
+
+        skewed_cols = []
+        for c in self.semantic_types['continuous']:
+            skew = self.df[c].dropna().skew()
+            if abs(skew) > 1.0:
+                skewed_cols.append((c, round(skew, 2)))
+
+        self.quality_report_ = {
+            'duplicate_rows': duplicates,
+            'constant_columns': constants,
+            'high_missing_columns': high_missing,
+            'high_cardinality_categorical': high_cardinality,
+            'skewed_continuous_columns': skewed_cols
+        }
+
+        self._log(f"Duplicate Rows: {duplicates}")
+        self._log(f"Constant Columns: {constants if constants else 'None'}")
+        self._log(f"Columns >50% Missing: {high_missing if high_missing else 'None'}")
+        self._log(f"High Cardinality Categorical (>10 levels): {high_cardinality if high_cardinality else 'None'}")
+        self._log(f"Highly Skewed Continuous (|skew| > 1): {skewed_cols if skewed_cols else 'None'}\n")
+        return self
+
+    def detect_outliers(self) -> 'DataAnalyzer':
+        """Evaluates continuous features for outliers via Z-Score or IQR."""
+        self._log("==================================================")
+        self._log("2. OUTLIER DETECTION")
+        self._log("==================================================")
+        
+        results = []
+        for col in self.semantic_types['continuous']:
+            s = self.df[col].dropna()
+            if len(s) < 10:
+                continue
+
+            # Normality test via Shapiro-Wilk (Sampled if n > 5000)
+            sample_s = s.sample(min(len(s), 5000), random_state=self.random_state)
+            _, p_val = stats.shapiro(sample_s)
+            is_normal = p_val > 0.05
+
+            if is_normal:
+                method = "Z-Score (>3)"
+                z_scores = np.abs(stats.zscore(s))
+                outliers = int((z_scores > 3).sum())
+            else:
+                method = "IQR (1.5x)"
+                q1, q3 = s.quantile(0.25), s.quantile(0.75)
+                iqr = q3 - q1
+                outliers = int(((s < (q1 - 1.5 * iqr)) | (s > (q3 + 1.5 * iqr))).sum())
+
+            pct = (outliers / len(s)) * 100
+            results.append({"Column": col, "Method": method, "Outliers": outliers, "Percentage": round(pct, 2)})
+
+        if results:
+            self.outlier_report_ = pd.DataFrame(results)
+            self._log(self.outlier_report_.to_string(index=False))
+        else:
+            self._log("No continuous columns available for outlier detection.")
+        self._log("")
+        return self
+
+    def run_bivariate_stats(self) -> 'DataAnalyzer':
+        """Performs statistical hypothesis tests against the target variable."""
+        if not self.target_col:
+            return self
+
+        self._log("==================================================")
+        self._log("3. BIVARIATE STATISTICAL TESTS (vs. Target)")
+        self._log("==================================================")
+        
+        target_s = self.df[self.target_col]
+        target_is_cont = self.target_col in self.semantic_types['continuous']
+        results = []
+
+        for col in self.df.columns:
+            if col == self.target_col:
+                continue
+            
+            sub_df = self.df[[col, self.target_col]].dropna()
+            if len(sub_df) < 10:
+                continue
+
+            feature_is_cont = col in self.semantic_types['continuous']
+
+            # 1. Continuous vs Continuous (Pearson)
+            if feature_is_cont and target_is_cont:
+                r, p_val = stats.pearsonr(sub_df[col], sub_df[self.target_col])
+                results.append({"Feature": col, "Test": "Pearson Correlation", "Metric": round(r, 4), "p-value": round(p_val, 5)})
+
+            # 2. Categorical vs Categorical (Chi-Square)
+            elif not feature_is_cont and not target_is_cont:
+                contingency = pd.crosstab(sub_df[col], sub_df[self.target_col])
+                chi2, p_val, _, _ = stats.chi2_contingency(contingency)
+                results.append({"Feature": col, "Test": "Chi-Square", "Metric": round(chi2, 4), "p-value": round(p_val, 5)})
+
+            # 3. Continuous vs Categorical (ANOVA)
+            else:
+                cont_col = col if feature_is_cont else self.target_col
+                cat_col = self.target_col if feature_is_cont else col
+                
+                groups = [group[cont_col].values for _, group in sub_df.groupby(cat_col)]
+                if len(groups) > 1:
+                    f_stat, p_val = stats.f_oneway(*groups)
+                    results.append({"Feature": col, "Test": "ANOVA (F-test)", "Metric": round(f_stat, 4), "p-value": round(p_val, 5)})
+
+        if results:
+            self.bivariate_stats_ = pd.DataFrame(results)
+            self._log(self.bivariate_stats_.to_string(index=False))
+        self._log("")
+        return self
+
+    def compute_feature_importance(self) -> 'DataAnalyzer':
+        """Calculates Mutual Information feature importance scores."""
+        if not self.target_col:
+            return self
+
+        self._log("==================================================")
+        self._log("4. FEATURE IMPORTANCE (Mutual Information)")
+        self._log("==================================================")
+
+        # Exclude columns with >50% missing data
+        high_missing_cols = list(self.quality_report_.get('high_missing_columns', {}).keys())
+        eval_cols = [c for c in self.df.columns if c != self.target_col and c not in high_missing_cols and c not in self.semantic_types['text']]
+
+        if not eval_cols:
+            return self
+
+        sub_df = self.df[eval_cols + [self.target_col]].dropna()
+        self._log(f"Rows evaluated after complete-case drop: {len(sub_df)} / {len(self.df)}")
+
+        X = sub_df[eval_cols].copy()
+        y = sub_df[self.target_col]
+
+        # Convert remaining object columns to categorical codes
+        discrete_mask = []
+        for c in eval_cols:
+            if c in self.semantic_types['categorical']:
+                X[c] = X[c].astype('category').cat.codes
+                discrete_mask.append(True)
+            else:
+                discrete_mask.append(False)
+
+        is_target_cat = self.target_col in self.semantic_types['categorical']
+        mi_fn = mutual_info_classif if is_target_cat else mutual_info_regression
+
+        mi_scores = mi_fn(X, y, discrete_features=discrete_mask, random_state=self.random_state)
+
+        self.feature_importance_ = (
+            pd.DataFrame({"Feature": eval_cols, "MutualInformation": mi_scores})
+            .sort_values("MutualInformation", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        self._log(self.feature_importance_.to_string(index=False))
+        self._log("")
+        return self
+
+    def detect_multicollinearity(self) -> 'DataAnalyzer':
+        """Computes Variance Inflation Factor (VIF) for continuous features."""
+        self._log("==================================================")
+        self._log("5. MULTICOLLINEARITY (VIF)")
+        self._log("==================================================")
+
+        cont_cols = self.semantic_types['continuous']
+        if len(cont_cols) < 2:
+            self._log("Fewer than 2 continuous features available. Skipping VIF.\n")
+            return self
+
+        sub_df = self.df[cont_cols].dropna()
+        if len(sub_df) < len(cont_cols) + 2:
+            self._log("Insufficient complete rows for VIF computation.\n")
+            return self
+
+        vif_data = []
+        X = sub_df.values
+        for i, col in enumerate(cont_cols):
+            try:
+                vif = variance_inflation_factor(X, i)
+                vif_data.append({"Feature": col, "VIF": round(vif, 2)})
+            except Exception:
+                vif_data.append({"Feature": col, "VIF": np.nan})
+
+        self.vif_report_ = pd.DataFrame(vif_data).sort_values("VIF", ascending=False).reset_index(drop=True)
+        self._log(self.vif_report_.to_string(index=False))
+        self._log("")
+        return self
+
+    def analyze_feature_interactions(self, top_n: int = 5, threshold: float = 0.0) -> 'DataAnalyzer':
+        """Calculates pairwise associations across all features (excluding target)."""
+        self._log("==================================================")
+        self._log("6. FEATURE-FEATURE INTERACTIONS")
+        self._log("==================================================")
+
+        cols = [c for c in self.df.columns if c != self.target_col and c not in self.semantic_types['text']]
+        pairs = []
+
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                c1, c2 = cols[i], cols[j]
+                sub_df = self.df[[c1, c2]].dropna()
+                if len(sub_df) < 20:
+                    continue
+
+                is_c1_cont = c1 in self.semantic_types['continuous']
+                is_c2_cont = c2 in self.semantic_types['continuous']
+
+                # Pearson |r|
+                if is_c1_cont and is_c2_cont:
+                    r, _ = stats.pearsonr(sub_df[c1], sub_df[c2])
+                    pairs.append({"Feature_1": c1, "Feature_2": c2, "Metric": "Pearson |r|", "Association": abs(r)})
+
+                # Cramér's V
+                elif not is_c1_cont and not is_c2_cont:
+                    contingency = pd.crosstab(sub_df[c1], sub_df[c2])
+                    chi2, _, _, _ = stats.chi2_contingency(contingency)
+                    n = contingency.sum().sum()
+                    r, k = contingency.shape
+                    if min(r - 1, k - 1) > 0:
+                        v = np.sqrt(chi2 / (n * min(r - 1, k - 1)))
+                        pairs.append({"Feature_1": c1, "Feature_2": c2, "Metric": "Cramér's V", "Association": v})
+
+                # Correlation Ratio (Eta)
+                else:
+                    cont, cat = (c1, c2) if is_c1_cont else (c2, c1)
+                    groups = [g[cont].values for _, g in sub_df.groupby(cat)]
+                    if len(groups) > 1:
+                        grand_mean = sub_df[cont].mean()
+                        ss_total = np.sum((sub_df[cont] - grand_mean) ** 2)
+                        ss_between = np.sum([len(g) * (np.mean(g) - grand_mean) ** 2 for g in groups])
+                        eta = np.sqrt(ss_between / ss_total) if ss_total > 0 else 0
+                        pairs.append({"Feature_1": c1, "Feature_2": c2, "Metric": "Correlation Ratio (η)", "Association": eta})
+
+        if pairs:
+            df_pairs = pd.DataFrame(pairs).sort_values("Association", ascending=False)
+            self.top_feature_pairs_ = df_pairs[df_pairs["Association"] >= threshold].head(top_n).reset_index(drop=True)
+            self._log(self.top_feature_pairs_.to_string(index=False))
+        else:
+            self._log("No valid feature interactions found.")
+        self._log("")
+        return self
+
+    # =========================================================================
+    # VISUALIZATION ENGINE
+    # =========================================================================
+
+    def plot_missingness(self) -> 'DataAnalyzer':
+        """Generates missing value distribution bar charts and matrix heatmaps."""
+        missing = self.df.isnull().sum()
+        missing = missing[missing > 0]
+        if missing.empty:
+            return self
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Bar Chart
+        missing_pct = (missing / len(self.df)) * 100
+        sns.barplot(x=missing_pct.index, y=missing_pct.values, ax=axes[0], palette="viridis")
+        axes[0].set_title("Missing Data Percentage per Feature")
+        axes[0].set_ylabel("Percentage (%)")
+        axes[0].tick_params(axis='x', rotation=45)
+
+        # Matrix Heatmap
+        sns.heatmap(self.df.isnull(), cbar=False, cmap="binary", ax=axes[1])
+        axes[1].set_title("Missing Value Matrix (Black = Missing)")
+        
+        plt.tight_layout()
+        self._save_or_show_plot(fig, "Data_Missingness_Analysis")
+        return self
+
+    def plot_bivariate(self) -> 'DataAnalyzer':
+        """Renders dynamic visualizations between features and target variable."""
+        if not self.target_col:
+            return self
+
+        target_is_cont = self.target_col in self.semantic_types['continuous']
+
+        for col in self.df.columns:
+            if col == self.target_col or col in self.semantic_types['text']:
+                continue
+
+            feature_is_cont = col in self.semantic_types['continuous']
+            sub_df = self.df[[col, self.target_col]].dropna()
+            
+            if sub_df[col].nunique() > self.MAX_CAT_CARDINALITY and not feature_is_cont:
+                continue
+
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+
+            # 1. Continuous vs Continuous
+            if feature_is_cont and target_is_cont:
+                if len(sub_df) > 2000:
+                    ax.hexbin(sub_df[col], sub_df[self.target_col], gridsize=30, cmap='Blues')
+                    ax.set_title(f"Hexbin Density: {col} vs {self.target_col}")
+                else:
+                    sns.regplot(data=sub_df, x=col, y=self.target_col, ax=ax, scatter_kws={'alpha': 0.4})
+                    ax.set_title(f"Scatter & Regression: {col} vs {self.target_col}")
+
+            # 2. Categorical vs Categorical
+            elif not feature_is_cont and not target_is_cont:
+                crosstab = pd.crosstab(sub_df[col], sub_df[self.target_col], normalize='index') * 100
+                crosstab.plot(kind='bar', stacked=True, ax=ax, colormap='tab10')
+                ax.set_title(f"100% Stacked Bar: {col} vs {self.target_col}")
+                ax.set_ylabel("Percentage (%)")
+
+            # 3. Continuous vs Categorical
+            else:
+                cont_col = col if feature_is_cont else self.target_col
+                cat_col = self.target_col if feature_is_cont else col
+                sns.violinplot(data=sub_df, x=cat_col, y=cont_col, ax=ax, inner="quartile")
+                ax.set_title(f"Violin Plot: {cont_col} by {cat_col}")
+
+            plt.tight_layout()
+            self._save_or_show_plot(fig, f"Bivariate_{col}_vs_{self.target_col}")
+
+        return self
+
+    def plot_multivariate(self) -> 'DataAnalyzer':
+        """Generates Pearson correlation and Cramér's V heatmaps."""
+        # 1. Pearson Correlation Matrix (Continuous)
+        cont_cols = self.semantic_types['continuous']
+        if len(cont_cols) >= 2:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            corr = self.df[cont_cols].corr()
+            sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", ax=ax, vmin=-1, vmax=1)
+            ax.set_title("Pearson Correlation Matrix (Continuous Variables)")
+            plt.tight_layout()
+            self._save_or_show_plot(fig, "Multivariate_Pearson_Correlation")
+
+        # 2. Cramér's V Matrix (Categorical)
+        cat_cols = [c for c in self.semantic_types['categorical'] if self.df[c].nunique() <= self.MAX_CAT_CARDINALITY]
+        if len(cat_cols) >= 2:
+            matrix = pd.DataFrame(index=cat_cols, columns=cat_cols, dtype=float)
+            for c1 in cat_cols:
+                for c2 in cat_cols:
+                    if c1 == c2:
+                        matrix.loc[c1, c2] = 1.0
+                    else:
+                        sub = self.df[[c1, c2]].dropna()
+                        contingency = pd.crosstab(sub[c1], sub[c2])
+                        chi2, _, _, _ = stats.chi2_contingency(contingency)
+                        n = contingency.sum().sum()
+                        r, k = contingency.shape
+                        matrix.loc[c1, c2] = np.sqrt(chi2 / (n * min(r - 1, k - 1))) if min(r - 1, k - 1) > 0 else 0
+
+            fig, ax = plt.subplots(figsize=(8, 6))
+            sns.heatmap(matrix.astype(float), annot=True, fmt=".2f", cmap="Blues", ax=ax, vmin=0, vmax=1)
+            ax.set_title("Cramér's V Association Matrix (Categorical Variables)")
+            plt.tight_layout()
+            self._save_or_show_plot(fig, "Multivariate_Cramers_V_Matrix")
+
+        return self
+
+    def plot_time_series(self) -> 'DataAnalyzer':
+        """Plots target variable monthly trends over detected datetime columns."""
+        if not self.target_col or not self.semantic_types['datetime']:
+            return self
+
+        for date_col in self.semantic_types['datetime']:
+            sub_df = self.df[[date_col, self.target_col]].dropna()
+            if sub_df.empty:
+                continue
+
+            sub_df = sub_df.set_index(date_col).resample('M').mean()
+            
+            fig, ax = plt.subplots(figsize=(9, 4))
+            ax.plot(sub_df.index, sub_df[self.target_col], marker='o', linestyle='-', color='b')
+            ax.set_title(f"Monthly Average of {self.target_col} over {date_col}")
+            ax.set_ylabel(f"Mean {self.target_col}")
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            self._save_or_show_plot(fig, f"TimeSeries_{self.target_col}_by_{date_col}")
+
+        return self
+
+    # =========================================================================
+    # REPORT GENERATION & PIPELINE EXECUTION
+    # =========================================================================
+
+    def generate_report(self) -> str:
+        """Compiles generated analysis assets into a self-contained HTML/PDF report."""
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>DataAnalyzer Automated EDA Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 30px; background-color: #f8f9fa; color: #333; }}
+                h1 {{ color: #0056b3; border-bottom: 2px solid #0056b3; padding-bottom: 10px; }}
+                h2 {{ color: #333; margin-top: 30px; border-bottom: 1px solid #ccc; }}
+                .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+                img {{ max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; margin-top: 10px; }}
+                table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
+                th, td {{ text-align: left; padding: 8px; border: 1px solid #ddd; }}
+                th {{ background-color: #0056b3; color: white; }}
+            </style>
+        </head>
+        <body>
+            <h1>Automated Exploratory Data Analysis Report</h1>
+            <div class="card">
+                <h2>Dataset Summary</h2>
+                <p><strong>Total Rows:</strong> {self.df.shape[0]}</p>
+                <p><strong>Total Columns:</strong> {self.df.shape[1]}</p>
+                <p><strong>Target Column:</strong> {self.target_col if self.target_col else 'None'}</p>
+            </div>
+        """
+
+        for plot_data in self._encoded_plots:
+            html_content += f"""
+            <div class="card">
+                <h2>{plot_data['title']}</h2>
+                <img src="data:image/png;base64,{plot_data['image']}" alt="{plot_data['title']}" />
+            </div>
+            """
+
+        html_content += "</body></html>"
+
+        report_filename = os.path.join(self.save_dir, "eda_report.html")
+        with open(report_filename, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        self.report_path_ = os.path.abspath(report_filename)
+        self._log(f"Report generated successfully: {self.report_path_}")
+
+        if self.export_pdf:
+            try:
+                from weasyprint import HTML
+                pdf_filename = os.path.join(self.save_dir, "eda_report.pdf")
+                HTML(string=html_content).write_pdf(pdf_filename)
+                self._log(f"PDF exported successfully: {os.path.abspath(pdf_filename)}")
+            except ImportError:
+                self._log("Notice: 'weasyprint' not installed. PDF export skipped.")
+
+        return self.report_path_
+
+    def run_all(self, steps: Optional[List[str]] = None) -> 'DataAnalyzer':
+        """
+        Executes the complete EDA pipeline or a custom subset of steps.
+        
+        Available Steps:
+        'summarize', 'data_quality', 'outliers', 'bivariate_stats', 'feature_importance',
+        'multicollinearity', 'feature_interactions', 'missingness_plot', 'bivariate_plot',
+        'multivariate_plot', 'time_series_plot'
+        """
+        all_steps = {
+            'summarize': self.summarize,
+            'data_quality': self.data_quality_report,
+            'outliers': self.detect_outliers,
+            'bivariate_stats': self.run_bivariate_stats,
+            'feature_importance': self.compute_feature_importance,
+            'multicollinearity': self.detect_multicollinearity,
+            'feature_interactions': self.analyze_feature_interactions,
+            'missingness_plot': self.plot_missingness,
+            'bivariate_plot': self.plot_bivariate,
+            'multivariate_plot': self.plot_multivariate,
+            'time_series_plot': self.plot_time_series
+        }
+
+        execution_sequence = steps if steps else list(all_steps.keys())
+
+        for step in execution_sequence:
+            if step in all_steps:
+                all_steps[step]()
+            else:
+                self._log(f"Warning: Step '{step}' is unrecognized and was skipped.")
+
+        if self.download:
+            self.generate_report()
+
+        return self
+
+
+
