@@ -1,63 +1,73 @@
-# DataAnalyzer: Documentation
+# DataAnalyzer — API Documentation
 
-The **DataAnalyzer** library provides an automated, end-to-end Exploratory Data Analysis (EDA) pipeline. It is designed to ingest raw datasets, standardize and map variables into semantic roles, compute statistical hypothesis tests, calculate non-linear feature associations, dynamically select optimal charts, and compile self-contained reports in HTML or PDF format.
+**Package:** `aaa-eda-analyzer` (PyPI/install name) · **Import as:** `eda_analyzer`
+**Version:** 0.2.3
+
+`DataAnalyzer` provides an automated, end-to-end Exploratory Data Analysis (EDA)
+pipeline. It ingests raw datasets, standardizes and maps variables into semantic
+roles, computes statistical hypothesis tests, calculates non-linear feature
+associations, dynamically selects optimal charts, and compiles self-contained
+reports in HTML or PDF format.
 
 ---
 
-## 1. Prerequisites and Installation
-
-### Core Dependencies
-
-The library relies on standard data science and machine learning packages. Ensure the following dependencies are installed in your Python environment:
+## 1. Installation
 
 ```bash
-pip install pandas numpy seaborn matplotlib scipy scikit-learn
-
+pip install aaa-eda-analyzer
 ```
 
-### Optional Dependencies
-
-To enable PDF report generation alongside the default HTML format, install the `weasyprint` rendering library:
+For PDF report generation (via [weasyprint](https://weasyprint.org/)):
 
 ```bash
-pip install weasyprint
-
+pip install "aaa-eda-analyzer[pdf]"
 ```
+
+Core dependencies (installed automatically): `pandas`, `numpy`, `seaborn`,
+`matplotlib`, `scipy`, `scikit-learn`, `statsmodels`.
+
+> **Note on naming:** the distribution name on PyPI is `aaa-eda-analyzer`, but
+> the Python import name is `eda_analyzer`:
+> ```python
+> from eda_analyzer import DataAnalyzer
+> ```
+> This split between install name and import name is normal (same pattern as
+> `pip install beautifulsoup4` → `import bs4`).
 
 ---
 
 ## 2. Supported Data Structures and Semantic Type Mapping
 
-### Supported Input Data Structures
+### Supported input data structures
 
-The library standardizes incoming data into a Pandas DataFrame via an internal `_standardize_data()` wrapper. The following data formats are accepted:
+The library standardizes incoming data into a pandas `DataFrame` via an
+internal `_standardize_data()` step. Accepted formats:
 
-* **Pandas DataFrame (`pd.DataFrame`)**: Processed directly via explicit deep copy.
-* **Pandas Series (`pd.Series`)**: Automatically converted into a single-column DataFrame.
-* **Polars DataFrame (`pl.DataFrame`)**: Automatically converted via `.to_pandas()`.
-* **NumPy Array (`np.ndarray`)**: 1D arrays are converted to a single column named `feature_0`. 2D arrays are converted to columns named `feature_0`, `feature_1`, ..., `feature_n`.
-* **Dictionaries and Lists (`dict`, `list`)**: Ingested directly using standard `pd.DataFrame(data)` constructors.
+| Input type | Handling |
+|---|---|
+| `pd.DataFrame` | Processed directly via an explicit deep copy |
+| `pd.Series` | Converted into a single-column DataFrame |
+| `pl.DataFrame` (Polars) | Converted via `.to_pandas()` |
+| `np.ndarray` (1D) | Converted to a single column named `feature_0` |
+| `np.ndarray` (2D) | Converted to columns `feature_0, feature_1, ..., feature_n` |
+| `dict` / `list` | Ingested directly via `pd.DataFrame(data)` |
 
-### Internal Semantic Type Detection Engine
+### Semantic type detection engine
 
-Rather than relying strictly on native Python/Pandas dtypes, `DataAnalyzer` dynamically categorizes features into four semantic types via `_detect_semantic_types()`:
+Rather than relying strictly on native pandas dtypes, `DataAnalyzer`
+dynamically categorizes each feature into one of four semantic types via
+`_detect_semantic_types()`:
 
-| Semantic Type | Detection Criteria / Rules | Internal Usage |
-| --- | --- | --- |
-| **`datetime`** | Columns with `datetime64` data types or parsable time strings. | Triggers monthly trend plots in `plot_time_series()`. |
-| **`continuous`** | Numeric dtypes (`int`, `float`) where unique values $\ge 15$ AND the ratio of unique values to non-null entries $\ge 0.05$. | Used for Pearson correlation, Z-Score/IQR outlier analysis, ANOVA, VIF, and regression plots. |
-| **`categorical`** | 1. Numeric dtypes where unique values $< 15$ OR unique ratio $< 0.05$.<br>
-
-<br>2. Non-numeric dtypes (`object`, `string`, `category`) where unique values $< 20$ OR unique ratio $< 0.5$. | Used for Cramér's $V$, Chi-Square tests, Correlation Ratio ($\eta$), violin plots, and stacked bar charts. |
-| **`text`** | 1. Non-numeric dtypes with high unique ratios ($\ge 0.5$) or cardinality $\ge 20$.<br>
-
-<br>2. Columns containing $100\%$ null values. | Bypassed during statistical plot generation to prevent rendering errors. |
+| Semantic type | Detection criteria | Used for |
+|---|---|---|
+| **datetime** | `datetime64` dtype, or an object column whose values parse as dates | Monthly trend plots in `plot_time_series()` |
+| **continuous** | Numeric dtype, with unique values ≥ 15 **and** unique-value ratio ≥ 0.05 | Pearson correlation, Z-Score/IQR outlier analysis, ANOVA, VIF, regression plots |
+| **categorical** | Numeric dtype with unique values < 15 **or** unique ratio < 0.05; or non-numeric dtype with unique values < 20 **or** unique ratio < 0.5 | Cramér's V, Chi-Square tests, Correlation Ratio (η), violin plots, stacked bar charts |
+| **text** | Non-numeric dtype with high cardinality (unique ratio ≥ 0.5 or ≥ 20 unique values) | Excluded from statistical/plotting steps to avoid rendering errors |
 
 ---
 
-## 3. Configuration Parameters (Constructor Reference)
-
-The behavior of `DataAnalyzer` is customized during instantiation via its constructor parameters:
+## 3. Constructor Reference
 
 ```python
 DataAnalyzer(
@@ -71,185 +81,201 @@ DataAnalyzer(
     download: bool = False,
     export_pdf: bool = False
 )
-
 ```
 
 | Parameter | Type | Default | Description |
-| --- | --- | --- | --- |
-| **`data`** | `Any` | *Required* | The dataset to be analyzed (DataFrame, Series, Array, Dict, List). |
-| **`target_col`** | `str` | `None` | The target variable for predictive analysis. Unlocks target-centric statistical tests and charts. |
-| **`exclude_cols`** | `List[str]` | `None` | A list of column names to be entirely excluded from analysis (e.g., `['user_id', 'transaction_id']`). |
-| **`random_state`** | `int` | `42` | Seed value used for randomized sampling (e.g., Shapiro-Wilk tests) to ensure reproducible results. |
-| **`verbose`** | `bool` | `True` | If `True`, logs standard output, progress updates, and text-based tables to the console. |
-| **`show_plots`** | `bool` | `True` | If `True`, renders and displays visualizations inline. |
-| **`save_dir`** | `str` | `None` | Directory path where generated image assets and reports will be saved. |
-| **`download`** | `bool` | `False` | Enables headless execution mode (suppressing inline rendering), saving all outputs directly into an HTML report. |
-| **`export_pdf`** | `bool` | `False` | If `True` (and `download=True`), generates a PDF version of the report alongside the HTML file using `weasyprint`. |
+|---|---|---|---|
+| `data` | `Any` | required | Dataset to analyze (DataFrame, Series, array, dict, or list) |
+| `target_col` | `str` | `None` | Target variable for predictive analysis; unlocks target-centric tests and charts |
+| `exclude_cols` | `List[str]` | `None` | Column names to exclude entirely (e.g. `['user_id', 'transaction_id']`) |
+| `random_state` | `int` | `42` | Seed for randomized sampling (e.g. Shapiro-Wilk), for reproducibility |
+| `verbose` | `bool` | `True` | Log progress and text tables to the console |
+| `show_plots` | `bool` | `True` | Render visualizations inline |
+| `save_dir` | `str` | `None` | Directory to save generated image assets and reports |
+| `download` | `bool` | `False` | Headless mode — suppresses inline rendering, saves everything to an HTML report |
+| `export_pdf` | `bool` | `False` | If `True` (with `download=True`), also generates a PDF report via weasyprint |
 
 ---
 
-## 4. Operational Rules and Syntax Restrictions
+## 4. Operational Rules and Guards
 
-To maintain computational efficiency and prevent runtime failures, `DataAnalyzer` enforces the following internal constraints:
+**Target column**
+- `target_col` must match an existing column name, or the library logs a
+  warning and falls back to target-agnostic mode.
+- Target-centric methods (`run_bivariate_stats`, `compute_feature_importance`,
+  `plot_bivariate`, `plot_time_series`) return safely with no exception if no
+  target is set.
 
-### Target Column Constraints
+**Cardinality**
+- `MAX_CAT_CARDINALITY = 10` — categorical variables with more than 10 unique
+  levels are flagged in `data_quality_report()` and excluded from bivariate
+  plotting, Cramér's V matrices, and group tests.
 
-* The `target_col` string must match an existing column name in the dataset.
-* If `target_col` does not exist, the library logs a warning and falls back to target-agnostic EDA mode.
-* Target-centric methods (`run_bivariate_stats`, `compute_feature_importance`, `plot_bivariate`, `plot_time_series`) return safely without raising exceptions if no target column is specified.
+**Quasi-constant features**
+- `QUASI_CONSTANT_THRESHOLD = 0.95` — a column (not truly constant) where a
+  single value covers ≥95% of non-null rows is flagged in
+  `data_quality_report()` as low-variance/quasi-constant, separate from the
+  truly-constant check.
 
-### Cardinality Thresholds
+**Sample size / completeness guards**
+- Correlation Ratio (η): only evaluated with ≥ 20 complete cases across 2+
+  categories; otherwise returns `NaN`.
+- Normality check: Shapiro-Wilk samples a maximum of 5,000 rows for continuous
+  columns with more than 5,000 non-null values.
+- High-missing exclusion: features with > 50% missing values (per
+  `data_quality_report()`) are excluded from `compute_feature_importance()` to
+  avoid excessive row loss from `dropna()`.
+- VIF: requires at least 2 continuous features and `n ≥ (number of continuous
+  features + 2)` complete rows.
 
-* **`MAX_CAT_CARDINALITY = 10`**: Categorical variables with more than 10 unique levels are flagged in `data_quality_report()` and excluded from bivariate plotting, Cramér's V matrices, and group tests to avoid overcrowded visualizations.
-
-### Sample Size and Data Completeness Guards
-
-* **Correlation Ratio ($\eta$) Guard**: Evaluates continuous vs. categorical pairings only if the sub-dataframe contains at least 20 complete cases ($n \ge 20$) across 2 or more unique categories. Small sample sizes return `np.nan`.
-* **Normality Check Guard**: Shapiro-Wilk tests for outlier detection sample a maximum of 5,000 rows (using `random_state`) for continuous columns exceeding 5,000 non-null values.
-* **High-Missing Exclusion**: Features with $>50\%$ missing values identified during `data_quality_report()` are automatically excluded from `compute_feature_importance()` calculations to prevent excessive row drops during complete-case drops (`dropna()`).
-* **Multicollinearity (VIF) Limit**: Computing VIF requires a minimum of 2 continuous features and $n \ge (\text{number of continuous features} + 2)$ complete rows.
-
-### Filename and Character Sanitization
-
-* All plot export filenames undergo automatic Regex sanitization via `_sanitize_filename()`. Any non-alphanumeric character (spaces, parentheses, slashes, punctuation) is replaced with an underscore (`_`) to prevent path collisions and OS-level write errors.
+**Filenames**
+- All plot export filenames are sanitized via `_sanitize_filename()` — any
+  non-alphanumeric character is replaced with `_` to avoid path/OS issues.
 
 ---
 
-## 5. Core Methods Reference
+## 5. Core Methods
 
-The pipeline methods can be executed all at once using `run_all()`, or called individually for modular analysis.
+Run everything at once with `run_all()`, or call methods individually for a
+modular workflow.
 
-### Summarization & Data Quality
+**Summarization & data quality**
+- `summarize()` — row/column counts, memory usage, global missingness.
+- `data_quality_report()` — duplicate rows, constant columns, features with
+  > 50% missing, high-cardinality categoricals (> 10 levels), skewed
+  continuous features (`|skew| > 1`), and quasi-constant columns (a single
+  value covering ≥95% of rows).
+- `plot_missingness()` — missing-value bar chart plus a null-location matrix
+  heatmap.
+- `plot_univariate(top_n=None, columns=None)` — per-column univariate profile.
+  Summary stats (`univariate_summary_`) are always computed for **every**
+  eligible column; only a limited number get plotted (histogram+boxplot for
+  continuous, bar chart for categorical, count-over-time for datetime):
+  - `top_n`: how many columns to plot. Defaults to `MAX_UNIVARIATE_PLOTS` (10).
+    Pass `-1` for no cap. If `target_col` is set, columns are ranked by
+    relevance to the target (Mutual Information) and the top_n most related
+    are plotted, with the target itself always included. If no `target_col`
+    is set, there's nothing to rank by — the first `top_n` columns in dataset
+    order are plotted instead, with a warning logged.
+  - `columns`: explicit list of column names to plot, in the given order —
+    overrides the ranking. Invalid names are ignored with a warning.
 
-* **`summarize()`**: Outputs a high-level dataset overview, including row counts, column counts, memory usage, and global missing data percentages.
-* **`data_quality_report()`**: Scans for structural anomalies. Flags duplicate records, constant columns (zero variance), features with $>50\%$ missing values, high-cardinality categorical variables ($>10$), and highly skewed continuous distributions ($\vert{}\text{skew}\vert{} > 1$).
-* **`plot_missingness()`**: Generates a bar chart illustrating the percentage of missing values per feature, alongside a matrix heatmap detailing the exact location of null values across the dataset.
+**Statistical analysis**
+- `detect_outliers()` — Z-Score (`|Z| > 3`) for normal data (per
+  Shapiro-Wilk), IQR (`1.5×`) otherwise.
+- `run_bivariate_stats()` *(requires `target_col`)* — tests every feature
+  against the target, **checking assumptions before choosing a test** rather
+  than applying one blindly:
+  - Continuous vs. continuous: Pearson if both variables pass a Shapiro-Wilk
+    normality check, otherwise falls back to Spearman.
+  - Continuous vs. categorical: ANOVA if per-group normality and variance
+    homogeneity (Levene) both hold, otherwise falls back to Kruskal-Wallis.
+  - Categorical vs. categorical: Chi-Square, flagged as unreliable if too
+    many contingency cells have expected count < 5 (Cochran's rule).
 
-### Statistical Analysis
+  Results include `Assumptions_Met` (bool) and `Notes` (why a fallback test
+  was used, or why a result may be unreliable) columns.
+- `compute_feature_importance()` *(requires `target_col`)* — Mutual
+  Information ranking (classification or regression, auto-detected).
+- `detect_multicollinearity()` — VIF via OLS R²; VIF > 5.0 flags high
+  multicollinearity.
 
-* **`detect_outliers()`**: Evaluates continuous variables for extreme values. Dynamically selects the statistical approach based on distribution: Z-Scores ($\vert{}Z\vert{} > 3$) for normally distributed data (verified via Shapiro-Wilk) and the Interquartile Range method ($\text{IQR} \times 1.5$) for skewed data.
-* **`run_bivariate_stats()`**: *(Requires `target_col`)* Tests every feature against the target variable for statistical significance. Automatically applies Pearson Correlation ($r$), ANOVA ($F$), or Chi-Square ($\chi^2$) tests based on the data type pairing.
-* **`compute_feature_importance()`**: *(Requires `target_col`)* Ranks the predictive utility of all features against the target using Mutual Information (compatible with both classification and regression tasks).
-* **`detect_multicollinearity()`**: Computes the Variance Inflation Factor (VIF) for continuous features via Ordinary Least Squares (OLS) $R^2$. Variables with a VIF exceeding 5.0 are flagged as exhibiting high multicollinearity.
+**Visualization engine**
+- `plot_bivariate()` *(requires `target_col`)* — auto-selects the chart type:
+  - continuous vs. continuous, large N → hexbin density
+  - continuous vs. continuous, small N → scatter + regression line
+  - continuous vs. categorical → violin plot
+  - categorical vs. categorical → 100% stacked bar
+- `plot_multivariate()` — Pearson correlation heatmap (continuous) and
+  Cramér's V heatmap (categorical).
+- `plot_time_series()` — monthly trend of `target_col` over any detected
+  datetime column.
 
-### Intelligent Visualization Engine
-
-* **`plot_bivariate()`**: *(Requires `target_col`)* Acts as a routing engine that analyzes data types and volume to select the optimal visualization for feature-target relationships:
-* *Continuous vs. Continuous (Large N):* Hexbin density plot.
-* *Continuous vs. Continuous (Small N):* Scatterplot with linear regression overlay.
-* *Continuous vs. Categorical:* Violin plots or KDE density distributions.
-* *Categorical vs. Categorical:* 100% Stacked Bar charts.
-
-
-* **`plot_multivariate()`**: Computes and plots two distinct association matrices: a Pearson correlation heatmap for continuous variables, and a Cramér's V heatmap for categorical interactions.
-* **`plot_time_series()`**: If a datetime variable is detected, this method automatically aggregates and plots the monthly trend of the specified `target_col`.
-
-### Advanced Interactions
-
-* **`analyze_feature_interactions(top_n=5, threshold=0.0)`**: Analyzes interactions exclusively between independent features (excluding the target). Evaluates all possible feature pairings using Pearson $\vert{}r\vert{}$, Cramér's $V$, and Correlation Ratio ($\eta$), plotting detailed visualizations for the strongest `top_n` associations.
+**Advanced interactions**
+- `analyze_feature_interactions(top_n=5, threshold=0.0)` — pairwise
+  associations between independent features (Pearson |r| or Spearman
+  fallback, Cramér's V, Correlation Ratio η), plotted for the strongest
+  `top_n` pairs. Each row includes `Assumptions_Met` and `Notes`, same
+  fallback logic as `run_bivariate_stats()`.
 
 ---
 
 ## 6. Accessing Programmatic Results
 
-The library retains all computed metrics as class attributes, allowing for seamless integration into downstream scripts. By convention, populated result attributes end with an underscore (`_`).
+Result attributes are stored as class attributes and end with a trailing
+underscore by convention:
 
 ```python
-# Execute the full analysis pipeline
 analyzer.run_all()
 
-# Retrieve the DataFrame containing outlier detection metrics
-outliers_df = analyzer.outlier_report_
-
-# Retrieve a dictionary of data quality flags
-quality_metrics = analyzer.quality_report_
-print(f"Duplicate Rows Count: {quality_metrics['duplicate_rows']}")
-
-# Retrieve the DataFrame containing bivariate statistical test results
-stats_df = analyzer.bivariate_stats_
-
-# Retrieve the DataFrame ranking feature importance
-importance_df = analyzer.feature_importance_
-
-# Retrieve the Variance Inflation Factor report
-vif_df = analyzer.vif_report_
-
-# Retrieve top feature-feature interactions
-interactions_df = analyzer.top_feature_pairs_
-
+analyzer.quality_report_       # dict of data-quality flags
+analyzer.outlier_report_       # DataFrame of outlier detection metrics
+analyzer.bivariate_stats_      # DataFrame of bivariate test results
+analyzer.feature_importance_   # DataFrame ranking feature importance
+analyzer.vif_report_           # DataFrame of VIF scores
+analyzer.top_feature_pairs_    # DataFrame of top feature-feature interactions
+analyzer.univariate_summary_   # DataFrame of per-column stats (all cols) + Plotted flag
 ```
 
 ---
 
 ## 7. Generating Downloadable Reports
 
-For automated reporting, `DataAnalyzer` bundles all analyses, tables, and visualizations into a single, self-contained HTML file. Images are embedded using base64 encoding, ensuring the HTML file requires no external dependencies or image folders to render properly.
-
-### Headless Reporting Example
+All analyses, tables, and plots can be bundled into a single self-contained
+HTML file (images embedded as base64, no external assets needed).
 
 ```python
 import pandas as pd
+from eda_analyzer import DataAnalyzer
 
 df = pd.read_csv('housing_data.csv')
 
-# Initialize with download=True to activate headless reporting mode
 analyzer = DataAnalyzer(
     data=df,
     target_col='price',
     download=True,
-    export_pdf=True,         # Also exports a PDF report via WeasyPrint
+    export_pdf=True,          # also exports a PDF via weasyprint
     save_dir='monthly_reports'
 )
 
-# Execute the pipeline silently without popping up charts
 analyzer.run_all()
-
-# Retrieve the absolute file path of the generated report
 print(f"Report generated at: {analyzer.report_path_}")
-
 ```
 
-### Custom Pipeline Execution
-
-To execute specific analytical steps or generate a lightweight report, pass a list of step identifiers to `run_all()`:
+### Custom pipeline execution
 
 ```python
 analyzer.run_all(steps=['summarize', 'data_quality', 'missingness_plot', 'feature_importance'])
-
 ```
 
-**Available Step Identifiers:**
-`'summarize'`, `'data_quality'`, `'outliers'`, `'bivariate_stats'`, `'feature_importance'`, `'multicollinearity'`, `'feature_interactions'`, `'missingness_plot'`, `'bivariate_plot'`, `'multivariate_plot'`, `'time_series_plot'`.
+Available step identifiers: `'summarize'`, `'data_quality'`, `'outliers'`,
+`'bivariate_stats'`, `'feature_importance'`, `'multicollinearity'`,
+`'feature_interactions'`, `'missingness_plot'`, `'univariate_plot'`,
+`'bivariate_plot'`, `'multivariate_plot'`, `'time_series_plot'`.
 
 ---
 
-## 8. Complete Implementation Example: Titanic Dataset
-
-The following complete script demonstrates loading the Titanic dataset, excluding non-predictive identifiers, setting `Survived` as the target column, running the automated pipeline, and accessing the resulting metrics programmatically.
+## 8. Complete Example: Titanic Dataset
 
 ```python
 import pandas as pd
+from eda_analyzer import DataAnalyzer
 
-# 1. Load Titanic dataset
-df = pd.read_csv('/content/titanic.csv')
+df = pd.read_csv('titanic.csv')
 
-# 2. Instantiate DataAnalyzer
 analyzer = DataAnalyzer(
     data=df,
     target_col='Survived',
     exclude_cols=['PassengerId', 'Name', 'Ticket'],
     random_state=42,
     verbose=True,
-    show_plots=True,      # Set to False if running headless
-    download=False        # Set to True to build HTML report
+    show_plots=True,      # set False for headless runs
+    download=False        # set True to build an HTML report
 )
 
-# 3. Run all analytical steps
 analyzer.run_all()
 
-# 4. Access programmatic outputs
 print("\n=== PROGRAMMATIC RESULTS ===")
-
 print("\n1. High Missing Columns (>50%):")
 print(analyzer.quality_report_['high_missing_columns'])
 
@@ -264,5 +290,4 @@ print(analyzer.bivariate_stats_)
 
 print("\n5. Variance Inflation Factor (Multicollinearity):")
 print(analyzer.vif_report_)
-
 ```
