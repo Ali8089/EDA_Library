@@ -1,4 +1,4 @@
-# DataAnalyzer — API Documentation
+# DataAnalyzer — Documentation
 
 **Package:** `aaa-eda-analyzer` (PyPI/install name) · **Import as:** `eda_analyzer`
 **Version:** 0.2.3
